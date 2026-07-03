@@ -23,3 +23,7 @@ class AgentState(TypedDict):
     # The active card for this session. Written when a contact is logged,
     # read when a voice note arrives. This is the crux of the assignment.
     current_row_id: Optional[str]
+
+    # The authenticated user. Set from the verified JWT on every WebSocket turn
+    # so tools always have it in scope without the LLM touching it.
+    user_id: Optional[str]

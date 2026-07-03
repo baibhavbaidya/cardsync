@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { getMessages, uploadFile } from '../api';
+import { useAuth } from '@clerk/clerk-react';
+import { getMessages, uploadFile, joinWaitlist } from '../api';
 import { openSocket } from '../socket';
 import Message from './Message';
 import ConfirmCard from './ConfirmCard';
@@ -8,14 +9,19 @@ import Composer from './Composer';
 let _id = 0;
 const uid = () => ++_id;
 
-export default function ChatWindow({ session, onRename }) {
-  const [messages, setMessages]       = useState([]);
-  const [streaming, setStreaming]     = useState('');
-  const [busy, setBusy]               = useState(false);
-  const [interrupt, setInterrupt]     = useState(null);
-  const [wsState, setWsState]         = useState('connecting');
+export default function ChatWindow({ session, onRename, userEmail, onScanComplete }) {
+  const { getToken } = useAuth();
+  const [messages, setMessages]         = useState([]);
+  const [streaming, setStreaming]       = useState('');
+  const [busy, setBusy]                 = useState(false);
+  const [interrupt, setInterrupt]       = useState(null);
+  const [wsState, setWsState]           = useState('connecting');
   const [editingTitle, setEditingTitle] = useState(false);
-  const [titleValue, setTitleValue]   = useState('');
+  const [titleValue, setTitleValue]     = useState('');
+  const [limitReached, setLimitReached] = useState(false);
+  const [showLimitModal, setShowLimitModal] = useState(false);
+  const [waitlistEmail, setWaitlistEmail]   = useState('');
+  const [waitlistStatus, setWaitlistStatus] = useState(null); // null | 'sending' | 'joined' | 'error'
 
   // Ref holds the latest streaming text so WebSocket handlers never read stale state.
   const streamRef      = useRef('');
@@ -27,33 +33,39 @@ export default function ChatWindow({ session, onRename }) {
 
   // Load persisted message history.
   useEffect(() => {
-    getMessages(session.session_id).then(msgs => {
-      setMessages(msgs.map(m => ({
-        id: uid(),
-        type: m.role === 'user' ? 'user' : 'ai',
-        content: m.content,
-        mediaUrl: m.media_url,
-        mediaKind: m.type !== 'text' ? m.type : null,
-      })));
-    }).catch(() => {});
-  }, [session.session_id]);
+    getToken().then(token =>
+      getMessages(session.session_id, token).then(msgs => {
+        setMessages(msgs.map(m => ({
+          id: uid(),
+          type: m.role === 'user' ? 'user' : 'ai',
+          content: m.content,
+          mediaUrl: m.media_url,
+          mediaKind: m.type !== 'text' ? m.type : null,
+        })));
+      }).catch(() => {})
+    );
+  }, [session.session_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Open WebSocket once per session.
-  // `ignore` prevents the first (StrictMode-discarded) socket's callbacks from
-  // touching state. `closeWhenReady` avoids the "closed before connection
-  // established" warning by waiting for the socket to open before closing it.
-  // The second effect run is the real one: its socket becomes socketRef.current.
+  // Open WebSocket once per session. Token is fetched async then the socket is
+  // created. The `ignore` flag prevents a discarded (StrictMode) effect from
+  // touching state after its cleanup runs.
   useEffect(() => {
     let ignore = false;
-    const sock = openSocket(session.session_id, {
-      onOpen:  () => { if (!ignore) setWsState('open'); },
-      onClose: () => { if (!ignore) setWsState('closed'); },
-      onEvent: (event) => { if (!ignore) handleEvent(event); },
-    });
-    socketRef.current = sock;
+
+    (async () => {
+      const token = await getToken();
+      if (ignore) return;
+      const sock = openSocket(session.session_id, token, {
+        onOpen:  () => { if (!ignore) setWsState('open'); },
+        onClose: () => { if (!ignore) setWsState('closed'); },
+        onEvent: (event) => { if (!ignore) handleEvent(event); },
+      });
+      socketRef.current = sock;
+    })();
+
     return () => {
       ignore = true;
-      sock.closeWhenReady();
+      socketRef.current?.closeWhenReady();
     };
   }, [session.session_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -103,6 +115,15 @@ export default function ChatWindow({ session, onRename }) {
       flushStream();
       setInterrupt(null);
       setBusy(false);
+      onScanComplete?.();
+
+    } else if (event.type === 'limit_reached') {
+      flushStream();
+      setLimitReached(true);
+      setShowLimitModal(true);
+      setWaitlistEmail(userEmail);
+      setWaitlistStatus(null);
+      setBusy(false);
 
     } else if (event.type === 'error') {
       flushStream();
@@ -121,24 +142,26 @@ export default function ChatWindow({ session, onRename }) {
 
   async function send({ text, imageFile, audioFile }) {
     if (busy) return;
+    if (imageFile && limitReached) { setShowLimitModal(true); return; }
     // Reset streaming accumulator for the new turn.
     streamRef.current = '';
     setStreaming('');
     setBusy(true);
 
+    const token = await getToken();
     let imageKey = null;
     let audioKey = null;
     const userMsg = { id: uid(), type: 'user', content: null, mediaUrl: null, mediaKind: null };
 
     try {
       if (imageFile) {
-        const res = await uploadFile(session.session_id, imageFile, 'image');
+        const res = await uploadFile(session.session_id, imageFile, 'image', token);
         imageKey = res.key;
         userMsg.mediaUrl  = URL.createObjectURL(imageFile);
         userMsg.mediaKind = 'image';
         userMsg.content   = text || null;
       } else if (audioFile) {
-        const res = await uploadFile(session.session_id, audioFile, 'audio');
+        const res = await uploadFile(session.session_id, audioFile, 'audio', token);
         audioKey = res.key;
         userMsg.mediaUrl  = URL.createObjectURL(audioFile);
         userMsg.mediaKind = 'audio';
@@ -182,6 +205,22 @@ export default function ChatWindow({ session, onRename }) {
     socketRef.current?.send({ resume: decision });
   }
 
+  async function handleJoinWaitlist() {
+    setWaitlistStatus('sending');
+    try {
+      await joinWaitlist(waitlistEmail);
+      setWaitlistStatus('joined');
+    } catch {
+      setWaitlistStatus('error');
+    }
+  }
+
+  function openLimitModal() {
+    setWaitlistEmail(userEmail);
+    setWaitlistStatus(null);
+    setShowLimitModal(true);
+  }
+
   const isEmpty = messages.length === 0 && !streaming && !interrupt;
 
   return (
@@ -208,10 +247,11 @@ export default function ChatWindow({ session, onRename }) {
         <div className="empty-state">
           <p>Upload a visiting card to get started</p>
           <div className="empty-actions">
-            <label className="btn btn-primary">
+            <label className={`btn btn-primary${limitReached ? ' btn-disabled' : ''}`}
+                   onClick={limitReached ? (e) => { e.preventDefault(); openLimitModal(); } : undefined}>
               Upload card
               <input
-                type="file" accept="image/*" hidden
+                type="file" accept="image/*" hidden disabled={limitReached}
                 onChange={e => {
                   if (e.target.files[0]) send({ imageFile: e.target.files[0] });
                   e.target.value = '';
@@ -239,7 +279,40 @@ export default function ChatWindow({ session, onRename }) {
         </div>
       )}
 
-      <Composer ref={composerRef} onSend={send} busy={busy} />
+      <Composer ref={composerRef} onSend={send} busy={busy || limitReached} />
+
+      {showLimitModal && (
+        <div className="limit-overlay" onClick={() => setShowLimitModal(false)}>
+          <div className="limit-modal" onClick={e => e.stopPropagation()}>
+            <button className="limit-modal-close" onClick={() => setShowLimitModal(false)}>✕</button>
+            <h2 className="limit-modal-title">You've used your 2 free scans</h2>
+            <p className="limit-modal-sub">CardSync is currently in early access.</p>
+            {waitlistStatus === 'joined' ? (
+              <p className="limit-modal-success">You're on the list! We'll reach out soon.</p>
+            ) : (
+              <>
+                <input
+                  className="limit-modal-input"
+                  type="email"
+                  value={waitlistEmail}
+                  onChange={e => setWaitlistEmail(e.target.value)}
+                  placeholder="your@email.com"
+                />
+                <button
+                  className="btn btn-primary limit-modal-btn"
+                  disabled={waitlistStatus === 'sending' || !waitlistEmail.trim()}
+                  onClick={handleJoinWaitlist}
+                >
+                  {waitlistStatus === 'sending' ? 'Sending…' : 'Join the waitlist'}
+                </button>
+                {waitlistStatus === 'error' && (
+                  <p className="limit-modal-error">Something went wrong. Try again.</p>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </main>
   );
 }

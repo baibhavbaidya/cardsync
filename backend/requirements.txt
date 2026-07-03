@@ -10,9 +10,15 @@ langchain-core
 langchain-openai
 openai
 
-gspread
-google-auth
-pymongo>=4.9
+asyncpg
+sqlalchemy[asyncio]
+pymongo[srv]>=4.9
 boto3
 httpx
 python-dotenv
+
+clerk-backend-api
+PyJWT
+cryptography
+resend
+google-api-python-client

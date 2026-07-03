@@ -1,3 +1,4 @@
+# Legacy integration — not active in v2. Kept for reference.
 """Meta WhatsApp Cloud API. Sends a utility template alert to the manager."""
 
 import logging

@@ -42,3 +42,34 @@ class MessageOut(BaseModel):
 class UploadOut(BaseModel):
     key: str
     kind: Literal["image", "audio"]
+
+
+class UserSetupRequest(BaseModel):
+    email: str
+
+
+class UserSetupOut(BaseModel):
+    scan_count: int
+    notification_email: str
+
+
+class WaitlistRequest(BaseModel):
+    email: str
+
+
+class WaitlistOut(BaseModel):
+    status: str
+
+
+class ContactOut(BaseModel):
+    id: str
+    name: str
+    phone: str
+    email: str
+    company: str
+    website: Optional[str] = None
+    linkedin: Optional[str] = None
+    audio_url: Optional[str] = None
+    transcript: Optional[str] = None
+    session_id: str
+    created_at: Optional[str] = None

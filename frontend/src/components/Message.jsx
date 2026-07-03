@@ -1,8 +1,8 @@
 const TOOL_LABELS = {
   extract_card_details:  'Extracting card details',
   check_duplicate:       'Checking for duplicates',
-  log_contact_to_sheet:  'Logging contact to sheet',
-  send_whatsapp_alert:   'Sending WhatsApp alert',
+  log_contact_to_sheet:  'Logging contact',
+  send_email_alert:      'Sending email alert',
   store_voice_note:      'Storing voice note',
   enrich_company:        'Enriching company data',
 };

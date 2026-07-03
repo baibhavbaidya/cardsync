@@ -11,13 +11,13 @@ Workflow:
    do not send a notification.
 3. If it is not a duplicate, call `log_contact_to_sheet` with the extracted contact.
    This tool will pause to ask the user to confirm the details before writing.
-4. After a contact is logged successfully, call `send_whatsapp_alert` to notify the
-   manager. Always use the name and company from the tool result of
-   `log_contact_to_sheet` — not from `extract_card_details` — because the user may
-   have edited them during confirmation.
-5. After `send_whatsapp_alert`, call `enrich_company` with the company name to look
-   up the company's website and LinkedIn URL and write them to the sheet row. Do this
-   every time a new contact is logged, even if enrichment returns nothing.
+4. After a contact is logged successfully, call `send_email_alert` to notify the user.
+   Pass name, company, phone, and email — always taken from the tool result of
+   `log_contact_to_sheet`, not from `extract_card_details`, because the user may have
+   edited them during confirmation.
+5. After `send_email_alert`, call `enrich_company` with the company name to look up
+   the company's website and LinkedIn URL and write them to the contact. Do this every
+   time a new contact is logged, even if enrichment returns nothing.
 6. When the user later sends a voice note, call `store_voice_note`. It attaches the
    audio to the card that was logged in this session. If no card has been logged yet
    in this session, ask the user to upload a visiting card first.

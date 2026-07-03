@@ -1,13 +1,16 @@
 """Agent tools.
 
 Every external integration is a tool here. Tools read the heavy stuff (files,
-the active row) from injected state, not from LLM-supplied arguments, so the LLM
-cannot hallucinate file keys or row ids.
+the active row, user_id) from injected state, not from LLM-supplied arguments,
+so the LLM cannot hallucinate file keys, row IDs, or user identities.
 
 State updates that must persist (current_row_id) are returned as a Command, which
 LangGraph applies to the graph state and the MongoDB checkpointer saves.
+
+Tools that call the Postgres database or MongoDB are async.
 """
 
+import asyncio
 import logging
 from typing import Annotated
 
@@ -16,9 +19,13 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command, interrupt
 
-from app.services import llm, sheets, storage, whatsapp
+from app.services import database, email as email_svc, llm, mongo, storage
 
 logger = logging.getLogger(__name__)
+
+
+def _require_user_id(state: dict) -> str | None:
+    return state.get("user_id") or None
 
 
 @tool
@@ -27,24 +34,29 @@ def extract_card_details(state: Annotated[dict, InjectedState]) -> dict:
     image_key = state.get("image_key")
     if not image_key:
         return {"error": "No card image was uploaded in this turn. Ask the user to upload one."}
-    # TODO: implement in services/llm.py (download from R2, gpt-4o vision, Pydantic schema)
     return llm.extract_card(image_key)
 
 
 @tool
-def check_duplicate(email: str, phone: str) -> dict:
-    """Check whether a contact with this email or phone already exists in the sheet."""
-    # TODO: implement in services/sheets.py (normalize email + phone, scan rows)
-    return sheets.find_duplicate(email=email, phone=phone)
+async def check_duplicate(
+    email: str,
+    phone: str,
+    state: Annotated[dict, InjectedState],
+) -> dict:
+    """Check whether a contact with this email or phone already exists."""
+    user_id = _require_user_id(state)
+    if not user_id:
+        return {"error": "User not identified. Please refresh the page."}
+    return await database.find_duplicate(user_id=user_id, email=email, phone=phone)
 
 
 @tool
-def log_contact_to_sheet(
+async def log_contact_to_sheet(
     contact: dict,
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
-    """Append a confirmed contact to the Google Sheet and remember it as the active card.
+    """Save a confirmed contact to the database and remember it as the active card.
 
     Pauses for human confirmation BEFORE writing. The interrupt is the first action so
     that on resume the node re-runs cleanly with no duplicate write (resumed nodes
@@ -65,18 +77,30 @@ def log_contact_to_sheet(
             }
         )
 
-    # 2. Apply any edits the user made in the confirmation step, then write.
-    # Merge session_id from state — the LLM's tool args never include it.
-    final_contact = {**contact, **decision.get("edits", {}), "session_id": state.get("session_id", "")}
-    row_id = sheets.append_contact(final_contact)
+    user_id = _require_user_id(state)
+    if not user_id:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        "User not identified — contact not logged.",
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
 
-    # 3. Persist the active row into state so the voice-note tool can find it later.
+    # 2. Apply any edits the user made in the confirmation step, then write.
+    final_contact = {**contact, **decision.get("edits", {}), "session_id": state.get("session_id", "")}
+    contact_id = await database.insert_contact(user_id=user_id, contact=final_contact)
+
+    # 3. Persist the active contact UUID into state so the voice-note tool can find it later.
     return Command(
         update={
-            "current_row_id": row_id,
+            "current_row_id": contact_id,
             "messages": [
                 ToolMessage(
-                    f"Logged contact to the sheet (row {row_id}). "
+                    f"Logged contact (id: {contact_id}). "
                     f"Final details — name: {final_contact['name']}, "
                     f"company: {final_contact['company']}, "
                     f"email: {final_contact['email']}, "
@@ -89,26 +113,42 @@ def log_contact_to_sheet(
 
 
 @tool
-def send_whatsapp_alert(name: str, company: str) -> str:
-    """Send the manager a WhatsApp alert that a new card was logged."""
-    # TODO: implement in services/whatsapp.py (Meta Cloud API template message)
-    status = whatsapp.send_alert(name=name, company=company)
-    return f"WhatsApp alert sent ({status})."
+async def send_email_alert(
+    name: str,
+    company: str,
+    phone: str,
+    email: str,
+    state: Annotated[dict, InjectedState],
+) -> str:
+    """Email the logged-in user a notification that a new contact was saved."""
+    user_id = _require_user_id(state)
+    if not user_id:
+        return "Email alert skipped — user not identified."
+    user = await mongo.get_user(user_id)
+    if not user or not user.get("notification_email"):
+        return "Email alert skipped — no notification email on file."
+    to_email = user["notification_email"]
+    status = await asyncio.to_thread(
+        email_svc.send_alert,
+        name=name, company=company, phone=phone, email=email, to_email=to_email,
+    )
+    return f"Email alert {status} to {to_email}."
 
 
 @tool
-def store_voice_note(
+async def store_voice_note(
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
     """Attach the uploaded voice note to the card logged earlier in this session.
 
     Transcribes first, then pauses for the user to review and correct the transcript
-    before writing it to the sheet.
+    before writing it to the database.
     """
-    row_id = state.get("current_row_id")
+    contact_id = state.get("current_row_id")
     audio_key = state.get("audio_key")
-    if not row_id:
+
+    if not contact_id:
         return "No card has been logged in this session yet. Ask the user to upload a visiting card first."
     if not audio_key:
         return "No voice note was uploaded in this turn."
@@ -116,7 +156,7 @@ def store_voice_note(
     # Transcribe before interrupting so the user sees the actual text.
     # On resume the tool re-runs from the top, so Whisper is called twice — acceptable for a prototype.
     audio_url = storage.public_url(audio_key)
-    transcript = llm.transcribe(audio_key)
+    transcript = await asyncio.to_thread(llm.transcribe, audio_key)
 
     decision = interrupt({"action": "confirm_transcript", "transcript": transcript, "audio_url": audio_url})
 
@@ -133,13 +173,13 @@ def store_voice_note(
         )
 
     final_transcript = decision.get("transcript", transcript)
-    sheets.update_audio(row_id=row_id, audio_url=audio_url, transcript=final_transcript)
+    await database.update_audio(contact_id=contact_id, audio_url=audio_url, transcript=final_transcript)
 
     return Command(
         update={
             "messages": [
                 ToolMessage(
-                    f"Voice note attached to the contact in row {row_id}.",
+                    f"Voice note attached to contact {contact_id}.",
                     tool_call_id=tool_call_id,
                 )
             ]
@@ -148,27 +188,28 @@ def store_voice_note(
 
 
 @tool
-def enrich_company(
+async def enrich_company(
     company: str,
     state: Annotated[dict, InjectedState],
 ) -> str:
-    """Find the company's website and LinkedIn URL and write them to the logged contact row.
+    """Find the company's website and LinkedIn URL and write them to the logged contact.
 
-    Called after send_whatsapp_alert. Reads current_row_id from state so the LLM
-    cannot hallucinate which row to update. Fails gracefully — never blocks the flow.
+    Called after send_email_alert. Reads current_row_id from state so the LLM
+    cannot hallucinate which contact to update. Fails gracefully — never blocks the flow.
     """
-    row_id = state.get("current_row_id")
-    if not row_id:
+    contact_id = state.get("current_row_id")
+
+    if not contact_id:
         return "No contact has been logged in this session yet — enrichment skipped."
 
     try:
-        result = llm.enrich_company(company)
+        result = await asyncio.to_thread(llm.enrich_company, company)
         website = result.get("website") or ""
         linkedin = result.get("linkedin") or ""
         if not website and not linkedin:
             logger.warning("enrich_company: no data found for %r", company)
             return "enrichment skipped"
-        sheets.update_enrichment(row_id=row_id, website=website, linkedin=linkedin)
+        await database.update_enrichment(contact_id=contact_id, website=website, linkedin=linkedin)
         return (
             f"Enrichment complete — website: {website or 'not found'}, "
             f"LinkedIn: {linkedin or 'not found'}."
@@ -182,7 +223,7 @@ ALL_TOOLS = [
     extract_card_details,
     check_duplicate,
     log_contact_to_sheet,
-    send_whatsapp_alert,
+    send_email_alert,
     store_voice_note,
     enrich_company,
 ]

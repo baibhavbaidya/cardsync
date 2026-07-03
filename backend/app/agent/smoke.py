@@ -4,8 +4,8 @@
 
 Drives the full two-flow sequence:
   Flow A (card): extract_card_details -> check_duplicate -> log_contact_to_sheet
-                 (interrupt + confirm) -> send_whatsapp_alert
-  Flow B (voice): store_voice_note -> updates the sheet row logged in Flow A
+                 (interrupt + confirm) -> send_email_alert -> enrich_company
+  Flow B (voice): store_voice_note (interrupt + confirm) -> updates the contact row
 
 Uses an InMemorySaver so no MongoDB connection is needed. The checkpointer keeps
 current_row_id alive across turns so Flow B can find the right row.
@@ -23,7 +23,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from app.agent.graph import build_graph
-from app.services import sheets, storage
+from app.services import storage
 
 IMAGE_PATH = "sample_card.jpg"
 AUDIO_PATH = "sample_voice.ogg"
@@ -61,24 +61,8 @@ async def stream_run(graph, state_or_command, config) -> bool:
     return interrupted
 
 
-SMOKE_EMAIL = "baibhavbaidya@gmail.com"
-
-
-def _clear_smoke_row() -> None:
-    """Delete any sheet row matching SMOKE_EMAIL so each run starts fresh."""
-    ws = sheets._sheet()
-    records = ws.get_all_values()  # includes header
-    for i, row in enumerate(records[1:], start=2):  # row index is 1-based, skip header
-        if row[2].strip().lower() == SMOKE_EMAIL.lower():
-            ws.delete_rows(i)
-            print(f"[setup] Deleted existing smoke row {i} from sheet.")
-            return
-    print("[setup] No existing smoke row found — sheet is clean.")
-
-
 async def main() -> None:
-    # ── Setup: clear stale smoke data, then upload both files to R2 ──────────
-    _clear_smoke_row()
+    # ── Setup: upload both files to R2 ───────────────────────────────────────
     print(f"[setup] Uploading {IMAGE_PATH} -> R2:{R2_IMAGE_KEY}")
     with open(IMAGE_PATH, "rb") as f:
         await storage.save(R2_IMAGE_KEY, f.read(), content_type="image/jpeg")

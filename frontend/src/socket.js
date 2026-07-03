@@ -1,7 +1,8 @@
 const WS_BASE = import.meta.env.VITE_WS_BASE_URL ?? 'ws://localhost:8000';
 
-export function openSocket(sessionId, { onEvent, onOpen, onClose } = {}) {
-  const ws = new WebSocket(`${WS_BASE}/ws/sessions/${sessionId}`);
+export function openSocket(sessionId, token, { onEvent, onOpen, onClose } = {}) {
+  const url = `${WS_BASE}/ws/sessions/${sessionId}?token=${encodeURIComponent(token)}`;
+  const ws = new WebSocket(url);
   const queue = [];
 
   ws.onopen = () => {
