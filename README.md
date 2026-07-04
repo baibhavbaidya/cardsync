@@ -1,263 +1,180 @@
 # CardSync
 
-A chat-based visiting card digitization system. Point it at a card photo and it extracts the contact details, checks for duplicates against a Google Sheet, logs the row, sends the manager a WhatsApp alert, and enriches the company with its website and LinkedIn page. Later in the same session, send a voice note and it transcribes and attaches it to the right contact row automatically.
+**Visiting card digitization via a chat interface.** Upload a card photo, the AI agent extracts the contact, confirms with you, logs it to your contact list, and sends you an email — all in one flow.
+
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-cardsync.dev-2563eb?style=flat-square)](https://www.cardsync.dev)
+![Python](https://img.shields.io/badge/Python-3.12-3776ab?style=flat-square&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.111-009688?style=flat-square&logo=fastapi&logoColor=white)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.x-f97316?style=flat-square)
+![React](https://img.shields.io/badge/React-18-61dafb?style=flat-square&logo=react&logoColor=black)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Neon-4169e1?style=flat-square&logo=postgresql&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-deployed-2496ed?style=flat-square&logo=docker&logoColor=white)
 
 ---
 
-## How it works
+## What it does
 
-The user interacts through a chat UI. Each session maps to one LangGraph agent thread. The agent decides which tools to call based on what the user sends:
+- Upload a visiting card photo — GPT-4o extracts name, phone, email, and company
+- The agent checks for duplicates before writing; re-uploads of the same card are silently rejected
+- You confirm (and optionally edit) the extracted details before anything is saved
+- Contact is logged to Postgres, company website and LinkedIn are auto-enriched, and you get an email via Resend
+- Send a voice note in the same session — Whisper transcribes it and attaches it to the right contact automatically
 
-- Upload a card image: agent calls `extract_card_details`, then `check_duplicate`, then (if new) `log_contact_to_sheet`, `send_whatsapp_alert`, and `enrich_company`
-- Send a voice note: agent calls `store_voice_note`, which transcribes it and attaches it to the card logged earlier in the same session
+---
 
-Two points in the flow pause for human confirmation before any writes happen: once before logging the contact (so the user can correct OCR errors), and once before saving the transcript (so the user can fix mishearings). Both support Confirm, Edit, or Reject.
+## Tech Stack
+
+| Category | Technology | Purpose |
+|---|---|---|
+| AI / ML | GPT-4o, Whisper | Vision extraction, company enrichment, voice transcription |
+| Agent framework | LangGraph 1.x | Tool-calling loop, HITL interrupts, MongoDB checkpointer |
+| Backend | FastAPI + uvicorn | REST endpoints and WebSocket server |
+| Frontend | React (Vite) | Chat UI, contacts view, CSV export |
+| Contact store | Neon Postgres (asyncpg) | Structured contacts, dedup, per-user isolation |
+| App state | MongoDB Atlas | Sessions, messages, users, LangGraph checkpoint collections |
+| Auth | Clerk | JWT issuance; backend verifies RS256 signature against JWKS |
+| File storage | Cloudflare R2 | Card images and voice audio; bytes never touch the LLM |
+| Email | Resend | Contact-logged notification to the authenticated user |
+| Deployment | AWS EC2 + Nginx, Vercel | Backend (Docker container), frontend (static) |
 
 ---
 
 ## Architecture
 
-### LangGraph agent
-
-The graph has two nodes in a loop:
-
-```
-START
-  |
-  v
-[agent]  <----+
-  |            |
-  | tool_calls |
-  v            |
-[tools] -------+
-  |
-  | no tool_calls
-  v
- END
-```
-
-`agent` calls `gpt-4o` with the full message history and a system prompt. If the model returns tool calls, `tools` (a LangGraph `ToolNode`) executes them and appends the results. This loops until the model returns a plain text response.
-
-The MongoDB checkpointer saves the full graph state after every step, keyed by `thread_id = session_id`. This is what allows a voice note sent in a later WebSocket turn to find the `current_row_id` that was written when the card was logged earlier.
-
-### State
-
-```python
-class AgentState(TypedDict):
-    messages: list          # full conversation history (append-only)
-    session_id: str         # MongoDB session + LangGraph thread ID
-    image_key: str | None   # R2 key set this turn, read by extract_card_details
-    audio_key: str | None   # R2 key set this turn, read by store_voice_note
-    current_row_id: str | None  # Sheet row written by log_contact_to_sheet,
-                                # read by store_voice_note and enrich_company
-```
-
-`current_row_id` is the link between a card and any subsequent voice notes. It persists across WebSocket reconnects because the checkpointer writes it to MongoDB after every tool step.
-
-### Tools
-
-| Tool | What it does |
-|------|--------------|
-| `extract_card_details` | Downloads the image from R2, calls gpt-4o vision with a structured output schema, returns name/phone/email/company |
-| `check_duplicate` | Scans the Google Sheet for a matching normalized email (primary) or phone (fallback) |
-| `log_contact_to_sheet` | Calls `interrupt()` to pause for user confirmation, then appends the row and writes `current_row_id` into state |
-| `send_whatsapp_alert` | POSTs a template message to the Meta Graph API |
-| `enrich_company` | Asks gpt-4o for the company's website and LinkedIn URL and writes them to columns E/F |
-| `store_voice_note` | Transcribes audio with Whisper, calls `interrupt()` for transcript review, writes audio URL and transcript to columns G/H |
-
-File bytes never pass through the LLM. Tools receive an R2 key from injected state and fetch the bytes themselves.
-
-### Services
-
-Each external integration lives in its own module under `app/services/`:
-
-- `llm.py` - gpt-4o vision extraction, gpt-4o enrichment, Whisper transcription
-- `sheets.py` - gspread client, dedup, append, update
-- `whatsapp.py` - Meta Cloud API template messages
-- `storage.py` - Cloudflare R2 via boto3 S3-compatible API
-- `mongo.py` - AsyncMongoClient for sessions and message history
-
-### WebSocket protocol
-
-Files are uploaded via REST first, then the key is sent over the socket.
-
-Client to server:
-```json
-{ "text": "...", "image_key": "...", "audio_key": "..." }
-{ "resume": { "decision": "confirm" } }
-{ "resume": { "decision": "edit", "edits": { "name": "..." } } }
-{ "resume": { "decision": "reject" } }
-```
-
-Server to client (streamed):
-```json
-{ "type": "token",     "data": "partial text..." }
-{ "type": "tool",      "data": { "name": "extract_card_details", "status": "running" } }
-{ "type": "tool",      "data": { "name": "extract_card_details", "status": "done" } }
-{ "type": "interrupt", "data": { "action": "confirm_contact", "contact": {...} } }
-{ "type": "done",      "data": {} }
-{ "type": "error",     "data": "Internal server error" }
-```
-
-The `done` event is sent only when the graph actually finishes. If the graph pauses on an interrupt, the server sends `interrupt` and waits. The client resumes by sending a `resume` message on the same socket.
+A single LangGraph `StateGraph` with two nodes (`agent → tools → agent`) drives the entire flow. The graph is compiled once at startup with a MongoDB checkpointer; every session gets its own `thread_id`, so state (including the active contact's UUID) survives across WebSocket reconnections. Files are uploaded to R2 via REST first; only the storage key enters agent state — raw bytes never pass through the LLM. See [DOCUMENTATION.md](./DOCUMENTATION.md) for the full architecture diagram, every tool signature, the HITL interrupt mechanism, and database schemas.
 
 ---
 
-## Environment variables
+## Key Features
 
-### Backend (`backend/.env`)
-
-| Variable | Description | Where to get it |
-|----------|-------------|-----------------|
-| `OPENAI_API_KEY` | OpenAI API key for gpt-4o and Whisper | platform.openai.com |
-| `GOOGLE_SERVICE_ACCOUNT_B64` | Base64-encoded service account JSON | GCP console -> IAM -> Service accounts -> create key (JSON), then `base64 -w0 key.json` on Linux or `[Convert]::ToBase64String([IO.File]::ReadAllBytes("key.json"))` on Windows |
-| `GOOGLE_SHEET_ID` | ID from the Sheet URL: `docs.google.com/spreadsheets/d/{ID}/` | Google Sheets URL bar |
-| `MONGODB_URI` | Atlas connection string | Atlas dashboard -> Connect -> Drivers |
-| `R2_ACCOUNT_ID` | Cloudflare account ID | R2 dashboard URL or Account Home |
-| `R2_ACCESS_KEY_ID` | R2 API token access key ID | R2 -> Manage R2 API Tokens |
-| `R2_SECRET_ACCESS_KEY` | R2 API token secret key | Same page, shown once on creation |
-| `R2_BUCKET` | Name of the R2 bucket | R2 dashboard |
-| `R2_PUBLIC_URL` | Public bucket URL (e.g. `https://pub-xxx.r2.dev`) | R2 bucket settings -> Public access |
-| `WHATSAPP_TOKEN` | Meta Graph API access token | Meta for Developers -> WhatsApp -> API Setup |
-| `WHATSAPP_PHONE_NUMBER_ID` | Phone number ID for the sending number | Same page |
-| `WHATSAPP_RECIPIENT` | Recipient number in international format without `+` (e.g. `919876543210`) | The number to notify |
-| `WHATSAPP_TEMPLATE_NAME` | Approved template name, or `hello_world` for testing | Meta -> WhatsApp -> Message Templates |
-| `CORS_ORIGINS` | Comma-separated allowed origins, e.g. `https://your-app.vercel.app` | Your Vercel deployment URL |
-
-The Google Sheet must have this header row (row 1, columns A through J):
-
-```
-Name | Phone | Email | Company | Website | LinkedIn | Audio URL | Transcript | Session ID | Created At
-```
-
-Share the sheet with the service account email (found in the JSON key file) as an editor.
-
-### Frontend (`frontend/.env`)
-
-| Variable | Description |
-|----------|-------------|
-| `VITE_API_BASE_URL` | Backend HTTP URL, e.g. `http://localhost:8000` locally or `https://your-app.onrender.com` in prod |
-| `VITE_WS_BASE_URL` | Backend WebSocket URL, e.g. `ws://localhost:8000` locally or `wss://your-app.onrender.com` in prod |
+- **GPT-4o structured extraction** — uses `response_format` with a Pydantic schema; the model cannot return malformed JSON
+- **HITL confirmation** — `interrupt()` fires before any database write; on resume the tool re-runs from the top, making confirmation idempotent
+- **Dedup with normalisation** — email (lowercase + strip) and phone (digits only) are compared after normalisation; checks run before the confirm step
+- **Company enrichment** — `enrich_company` tool asks GPT-4o for website and LinkedIn URL and writes them to the contact row
+- **Whisper voice notes** — transcript is shown for review before being written; `current_row_id` in checkpointed state links the note to the correct contact
+- **Resend email alerts** — sent to the authenticated user's `notification_email` after every successful log
+- **Clerk auth** — RS256 JWT verified against Clerk JWKS; WebSocket auth via `?token=` query param (browsers cannot set WS headers)
+- **Per-user data isolation** — every Postgres query and MongoDB operation includes `user_id` from the verified JWT
+- **Free tier with waitlist** — 2 card scans per account; limit modal captures email for waitlist via an idempotent upsert
 
 ---
 
-## Local setup
+## Local Setup
 
 ### Backend
 
 ```bash
 cd backend
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env
-# fill in .env with your credentials
-
+cp .env.example .env                                 # fill in values (see table below)
 uvicorn app.main:app --reload --port 8000
 ```
 
-The API runs at `http://localhost:8000`. Visit `/docs` for the auto-generated OpenAPI UI.
+API at `http://localhost:8000` — OpenAPI docs at `/docs`.
 
 ### Frontend
 
 ```bash
 cd frontend
 npm install
-cp .env.example .env
-# defaults point to localhost:8000, no changes needed for local dev
-
+cp .env.example .env                                 # defaults point to localhost:8000
 npm run dev
 ```
 
-The app runs at `http://localhost:5173`.
+App at `http://localhost:5173`.
 
-### Smoke test
-
-The smoke test drives the full agent flow without the UI. It uploads a real card image and voice note to R2, runs the agent end-to-end with an `InMemorySaver` (no MongoDB connection needed), and prints every tool call, tool result, and interrupt.
+### Agent smoke test (no UI)
 
 ```bash
 cd backend
-# place sample_card.jpg and sample_voice.ogg in the backend/ folder
 python -m app.agent.smoke
 ```
 
-Expected trace:
-1. Turn 1: `extract_card_details` -> `check_duplicate` -> `log_contact_to_sheet` -> INTERRUPT
-2. Turn 2 (resumed with a name edit): row logged, `send_whatsapp_alert`, `enrich_company`
-3. Turn 3: voice note -> `store_voice_note` -> INTERRUPT
-4. Turn 3 resume (with transcript edit): transcript written to sheet
+### Environment variables
 
-Run this before touching any endpoint code. It validates the agent logic independently of the API layer.
+**`backend/.env`**
+
+| Variable | Where to get it |
+|---|---|
+| `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com) |
+| `MONGODB_URI` | Atlas dashboard → Connect → Drivers (`mongodb+srv://...`) |
+| `DATABASE_URL` | Neon dashboard → Connection string (`postgresql://...`) |
+| `CLERK_SECRET_KEY` | Clerk dashboard → API Keys |
+| `RESEND_API_KEY` | [resend.com](https://resend.com) → API Keys |
+| `R2_ACCOUNT_ID` | Cloudflare dashboard → R2 |
+| `R2_ACCESS_KEY_ID` | R2 → Manage R2 API Tokens |
+| `R2_SECRET_ACCESS_KEY` | Same page (shown once on creation) |
+| `R2_BUCKET` | R2 bucket name |
+| `R2_PUBLIC_URL` | R2 bucket → Settings → Public access URL |
+| `CORS_ORIGINS` | Comma-separated allowed origins, e.g. `http://localhost:5173` |
+
+**`frontend/.env`**
+
+| Variable | Value |
+|---|---|
+| `VITE_CLERK_PUBLISHABLE_KEY` | Clerk dashboard → API Keys (starts with `pk_`) |
+| `VITE_API_BASE_URL` | `http://localhost:8000` (local) or `https://api.cardsync.dev` (prod) |
+| `VITE_WS_BASE_URL` | `ws://localhost:8000` (local) or `wss://api.cardsync.dev` (prod) |
 
 ---
 
 ## Deployment
 
-### Backend on Render
+Full guide (Docker build, EC2 setup, Nginx config, Let's Encrypt SSL, domain wiring) is in [DOCUMENTATION.md § Deployment](./DOCUMENTATION.md#10-deployment).
 
-A `Dockerfile` is included in `backend/`, so the recommended approach is to deploy as a Docker container. Render auto-detects the Dockerfile when the environment is set to Docker.
+| | URL |
+|---|---|
+| Frontend | https://www.cardsync.dev |
+| Backend API | https://api.cardsync.dev |
+| Health check | https://api.cardsync.dev/health |
+| Hosting | AWS EC2 t3.micro (Mumbai) + Nginx + Let's Encrypt / Vercel |
 
-1. Push the repo to GitHub.
-2. Create a new Render **Web Service** pointing at the `backend/` directory.
-3. Set the **Environment** to **Docker**. Render will detect the `Dockerfile` automatically — no separate build or start commands are needed.
-4. Add all backend environment variables in the Render dashboard under **Environment**.
-5. Set `CORS_ORIGINS` to your Vercel frontend URL.
+---
 
-To test the Docker build locally before pushing:
+## Project Structure
 
-```bash
-cd backend
-docker build -t cardsync-backend .
-docker run -p 8000:8000 --env-file .env cardsync-backend
+```
+backend/
+  app/
+    main.py              # FastAPI app, all REST routes, WebSocket handler
+    auth.py              # Clerk JWKS fetch and RS256 JWT verification
+    models.py            # Pydantic request/response schemas
+    agent/
+      graph.py           # StateGraph definition, checkpointer wiring
+      state.py           # AgentState TypedDict
+      tools.py           # All @tool functions (the only place external calls are made)
+      prompts.py         # System prompt encoding the agent workflow
+      runner.py          # graph.astream → WebSocket event emitter
+    services/
+      database.py        # Neon Postgres via SQLAlchemy async + asyncpg
+      mongo.py           # MongoDB: sessions, messages, users, waitlist
+      llm.py             # GPT-4o vision extraction, enrichment, Whisper transcription
+      storage.py         # Cloudflare R2 via boto3 S3-compatible API
+      email.py           # Resend transactional email
+      whatsapp.py        # (legacy) Meta WhatsApp Cloud API
+      sheets.py          # (legacy) Google Sheets via gspread
+  Dockerfile
+  requirements.txt
+
+frontend/
+  src/
+    App.jsx              # Root: session state, scan count, tab routing
+    api.js               # All fetch() calls to the REST API
+    socket.js            # WebSocket wrapper with pre-connect send queue
+    components/
+      LandingPage.jsx    # Marketing page with CardSwap animation
+      Sidebar.jsx        # Session list, tabs, scan counter, profile footer
+      ChatWindow.jsx     # WebSocket consumer, message thread, interrupt handling
+      ContactsView.jsx   # Full contacts table with search, sort, CSV export
+      ConfirmCard.jsx    # HITL confirmation UI for contacts and transcripts
+      Composer.jsx       # Text input + image/audio upload + record button
+      Message.jsx        # Individual message bubble renderer
+      CardSwap.jsx       # GSAP card stack animation (landing page)
 ```
 
-The Render free tier sleeps after 15 minutes of inactivity. Use UptimeRobot or a similar pinger on the `/health` endpoint to keep it awake before demos.
-
-### Frontend on Vercel
-
-1. Import the repo in Vercel and set the root directory to `frontend/`.
-2. Add `VITE_API_BASE_URL` and `VITE_WS_BASE_URL` pointing at your Render service URL (use `https://` and `wss://`).
-3. Deploy. Vercel detects Vite automatically.
-
-### MongoDB Atlas
-
-Create a free M0 cluster. Under **Network Access**, add `0.0.0.0/0` to allow connections from Render (or restrict to Render's static outbound IPs if you have a paid plan). Copy the connection string into `MONGODB_URI`.
-
-### WhatsApp template
-
-Submit your custom template (`new_card_logged`) for approval as early as possible. Meta approval takes anywhere from a few minutes to 24 hours. While waiting, set `WHATSAPP_TEMPLATE_NAME=hello_world` to confirm the API connection works. The `hello_world` template takes no parameters so the alert body will be generic, but the plumbing is identical.
-
-For production, replace the temporary 24-hour developer token with a permanent one. In Meta Business Manager, go to **Business Settings -> Users -> System Users**, create a system user, assign it the WhatsApp app with the `whatsapp_business_messaging` permission, and generate an access token. System user tokens do not expire. Set that token as `WHATSAPP_TOKEN` in your Render environment variables.
-
 ---
 
-## Design decisions
+## Legacy Integrations
 
-**Google Sheets as the contact database.** The brief specified it and it fits the use case well: non-technical users can open the sheet directly, filter and sort contacts, and spot errors without any custom admin UI. The tradeoff is that every dedup check requires a full `get_all_records()` call, which is slow at scale. At the volume of visiting cards collected at a conference it is fine.
-
-**MongoDB for sessions and the checkpointer.** The LangGraph MongoDB checkpointer needs a persistent store to save agent state between WebSocket turns. Using the same Atlas cluster for the session and message store keeps the infrastructure to one database. MongoDB is never used as the contact store.
-
-**One session, one primary contact.** `current_row_id` in agent state is a single value. Each session is designed around one card: log it, enrich it, attach a voice note. If a second card is logged in the same session, `current_row_id` gets overwritten and voice notes will attach to the new card. This is a deliberate simplification, not an oversight.
-
-**HITL before writes, not after.** Both `log_contact_to_sheet` and `store_voice_note` call `interrupt()` as the very first line of the tool body. LangGraph resumes a tool by re-running it from the top, so the write only happens after confirmation. If the interrupt fired after the write, a reject would have no effect.
-
-**HITL extended to transcripts.** Whisper is accurate but not perfect, especially on names and company jargon. Showing the transcript before saving gives the user one chance to fix it. The same confirm/edit/reject UI handles both interrupts with no extra frontend code.
-
-**Files by reference only.** Images and audio are uploaded to R2 via a REST endpoint first. Only the storage key enters the agent state. The LLM never sees raw bytes or base64. This keeps token costs low and avoids the model attempting to reason about file contents it was not asked about.
-
----
-
-## Known limitations
-
-**Voice notes attach to the most recently logged card per session.** There is no UI to select which contact a voice note refers to. If you log two cards in one session and send a voice note, it attaches to the second card.
-
-**WhatsApp access token expires every 24 hours in development.** The temporary token from the Meta developer dashboard is only valid for one day. For production, create a System User in Meta Business Manager and generate a permanent token. See the Meta docs under "System User Access Tokens."
-
-**Whisper is called twice on transcript resume.** `store_voice_note` transcribes before calling `interrupt()` so the user sees the real text immediately. When the user confirms, LangGraph re-runs the tool from the top and calls Whisper again. The two results are almost always identical. Fixing this properly would require caching the first transcript in agent state.
-
-**Render free tier cold starts.** The backend takes 30 to 60 seconds to respond after sleeping. Pin it with a health check pinger before recording a demo.
+`backend/app/services/whatsapp.py` and `backend/app/services/sheets.py` are not imported or called anywhere in the active codebase. They are kept as reference implementations: `whatsapp.py` shows the Meta WhatsApp Cloud API template message flow (v1 notification method); `sheets.py` documents the original Google Sheets contact store (replaced by Neon Postgres in v2 for per-user isolation and query capability).
